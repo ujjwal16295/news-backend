@@ -9,7 +9,7 @@ class ImageAnalysis {
     const prompt = `Extract news articles from this Photo and format your response EXACTLY as a JSON array of objects. 
     Each object should have ONLY these two fields:
     - "headline": a concise title
-    - "summary": a brief summary
+    - "summary": a brief summary of two three lines if possible
     
     Example format:
     [
