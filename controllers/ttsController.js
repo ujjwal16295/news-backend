@@ -159,98 +159,38 @@
 
 const admin = require('firebase-admin');
 const PlayHT = require('playht');
+const { Readable } = require('stream');
 
-// Updated chunk function with 2000 character limit for PlayHT
-const chunkText = (text, maxChunkSize = 2000) => {
-  // Split text at sentence boundaries
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
-  const chunks = [];
-  let currentChunk = '';
-
-  for (const sentence of sentences) {
-    // If adding this sentence would exceed maxChunkSize, start a new chunk
-    if ((currentChunk + sentence).length > maxChunkSize && currentChunk.length > 0) {
-      chunks.push(currentChunk.trim());
-      currentChunk = '';
-    }
-    
-    // If a single sentence is longer than maxChunkSize, split it at word boundaries
-    if (sentence.length > maxChunkSize) {
-      // If current chunk has content, add it to chunks first
-      if (currentChunk.trim().length > 0) {
-        chunks.push(currentChunk.trim());
-        currentChunk = '';
-      }
-      
-      // Split long sentence into words
-      const words = sentence.split(' ');
-      let wordChunk = '';
-      
-      for (const word of words) {
-        if ((wordChunk + ' ' + word).length > maxChunkSize && wordChunk.length > 0) {
-          chunks.push(wordChunk.trim());
-          wordChunk = '';
-        }
-        wordChunk += (wordChunk ? ' ' : '') + word;
-      }
-      
-      // Add any remaining words
-      if (wordChunk.trim().length > 0) {
-        currentChunk = wordChunk.trim() + ' ';
-      }
-    } else {
-      currentChunk += sentence + ' ';
-    }
-  }
-
-  // Add the last chunk if it's not empty
-  if (currentChunk.trim().length > 0) {
-    chunks.push(currentChunk.trim());
-  }
-
-  // Final validation to ensure no chunk exceeds the limit
-  return chunks.map(chunk => {
-    if (chunk.length > maxChunkSize) {
-      return chunk.substring(0, maxChunkSize);
-    }
-    return chunk;
-  });
+// Updated chunk function to split into paragraphs
+const chunkText = (text) => {
+  // Split text into paragraphs
+  const paragraphs = text.split(/\n\s*\n/);
+  return paragraphs.filter(p => p.trim().length > 0);
 };
 
-// Function to generate speech for a single chunk using PlayHT SDK
-const generateSpeechChunk = async (text) => {
+// Function to generate speech stream for a single chunk
+const generateSpeechStream = async (text) => {
   try {
-    // Ensure text is within the 2000 character limit
-    if (text.length > 2000) {
-      throw new Error('Text chunk exceeds PlayHT 2000 character limit');
-    }
+    // Create a readable stream from text
+    const textStream = new Readable({
+      read() {
+        this.push(text);
+        this.push(null);
+      }
+    });
     
-    // Generate speech using PlayHT SDK instead of direct API calls
-    const generated = await PlayHT.generate(text, {
-      voiceId: 'Charlotte',
+    // Stream audio using PlayHT SDK
+    const audioStream = await PlayHT.stream(textStream, {
+      voiceId: 's3://voice-cloning-zero-shot/a59cb96d-bba8-4e24-81f2-e60b888a0275/charlottenarrativesaad/manifest.json',
       outputFormat: 'mp3',
       speed: 1.0,
       sampleRate: 24000,
       quality: 'draft'
     });
     
-    console.log('PlayHT Generation:', JSON.stringify(generated));
-    
-    // Extract the audio URL
-    const { audioUrl } = generated;
-    
-    if (!audioUrl) {
-      throw new Error('No audio URL returned from PlayHT');
-    }
-
-    // Download the audio file as arraybuffer
-    const fetch = await import('node-fetch');
-    const response = await fetch.default(audioUrl);
-    const buffer = await response.arrayBuffer();
-    
-    return Buffer.from(buffer);
+    return audioStream;
   } catch (error) {
-    console.error(`Error generating speech chunk:`, error);
+    console.error(`Error generating speech stream:`, error);
     throw error;
   }
 };
@@ -286,32 +226,38 @@ const generateSpeech = async (req, res) => {
           userId: process.env.PLAYHT_USER_ID
         });
         
-        // Split text into manageable chunks - ensuring 2000 char limit
-        const chunks = chunkText(text, 2000);
-        let audioBuffers = [];
+        // Split text into paragraphs
+        const paragraphs = chunkText(text);
+        
+        // Set headers for streaming
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Transfer-Encoding', 'chunked');
 
-        // Generate speech for each chunk
-        for (const chunk of chunks) {
+        // Stream paragraphs sequentially
+        for (const paragraph of paragraphs) {
           try {
-            const audioBuffer = await generateSpeechChunk(chunk);
-            audioBuffers.push(audioBuffer);
+            const paragraphStream = await generateSpeechStream(paragraph);
+            
+            // Pipe paragraph stream to response
+            await new Promise((resolve, reject) => {
+              paragraphStream.pipe(res, { end: false });
+              paragraphStream.on('end', resolve);
+              paragraphStream.on('error', reject);
+            });
           } catch (chunkError) {
-            console.error(`Error processing chunk: ${chunk.substring(0, 50)}...`, chunkError);
-            throw chunkError;
+            console.error(`Error processing paragraph: ${paragraph.substring(0, 50)}...`, chunkError);
+            res.status(500).json({ error: 'Failed to generate speech' });
+            return;
           }
         }
 
-        // Combine all audio buffers
-        const combinedBuffer = Buffer.concat(audioBuffers);
+        // End the response after all paragraphs
+        res.end();
 
         // Update user's generation count
         await admin.firestore().collection('users').doc(userId).update({
           voice_generation_count: admin.firestore.FieldValue.increment(-1)
         });
-
-        // Send combined audio back to client
-        res.set('Content-Type', 'audio/mpeg');
-        res.send(combinedBuffer);
       }
     }
   } catch (error) {
